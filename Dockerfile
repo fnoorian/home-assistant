@@ -1,29 +1,21 @@
-FROM python:3.5
-MAINTAINER Paulus Schoutsen <Paulus@PaulusSchoutsen.nl>
+ARG BUILD_FROM
+FROM ${BUILD_FROM}
 
-VOLUME /config
+ENV \
+    S6_SERVICES_GRACETIME=60000
 
-RUN mkdir -p /usr/src/app
-WORKDIR /usr/src/app
+WORKDIR /usr/src
 
-RUN pip3 install --no-cache-dir colorlog cython
+## Setup Home Assistant
+COPY . homeassistant/
+RUN \
+    pip3 install --no-cache-dir --no-index --only-binary=:all: --find-links "${WHEELS_LINKS}" \
+    -r homeassistant/requirements_all.txt \
+    && pip3 install --no-cache-dir --no-index --only-binary=:all: --find-links "${WHEELS_LINKS}" \
+    -e ./homeassistant \
+    && python3 -m compileall homeassistant/homeassistant
 
-# For the nmap tracker, bluetooth tracker, Z-Wave
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends nmap net-tools cython3 libudev-dev sudo libglib2.0-dev bluetooth libbluetooth-dev && \
-    apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+# Home Assistant S6-Overlay
+COPY rootfs /
 
-COPY script/build_python_openzwave script/build_python_openzwave
-RUN script/build_python_openzwave && \
-  mkdir -p /usr/local/share/python-openzwave && \
-  ln -sf /usr/src/app/build/python-openzwave/openzwave/config /usr/local/share/python-openzwave/config
-
-COPY requirements_all.txt requirements_all.txt
-# certifi breaks Debian based installs
-RUN pip3 install --no-cache-dir -r requirements_all.txt && pip3 uninstall -y certifi && \
-    pip3 install mysqlclient psycopg2 uvloop
-
-# Copy source
-COPY . .
-
-CMD [ "python", "-m", "homeassistant", "--config", "/config" ]
+WORKDIR /config

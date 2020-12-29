@@ -1,229 +1,320 @@
 """Helpers for components that manage entities."""
-from threading import Lock
+import asyncio
+from datetime import timedelta
+from itertools import chain
+import logging
+from types import ModuleType
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+
+import voluptuous as vol
 
 from homeassistant import config as conf_util
-from homeassistant.bootstrap import (prepare_setup_platform,
-                                     prepare_setup_component)
-from homeassistant.const import (
-    ATTR_ENTITY_ID, CONF_SCAN_INTERVAL, CONF_ENTITY_NAMESPACE,
-    DEVICE_DEFAULT_NAME)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_ENTITY_NAMESPACE, CONF_SCAN_INTERVAL
+from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.loader import get_component
-from homeassistant.helpers import config_per_platform, discovery
-from homeassistant.helpers.entity import generate_entity_id
-from homeassistant.helpers.event import track_utc_time_change
-from homeassistant.helpers.service import extract_entity_ids
+from homeassistant.helpers import (
+    config_per_platform,
+    config_validation as cv,
+    discovery,
+    entity,
+    service,
+)
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.loader import async_get_integration, bind_hass
+from homeassistant.setup import async_prepare_setup_platform
 
-DEFAULT_SCAN_INTERVAL = 15
+from .entity_platform import EntityPlatform
+
+DEFAULT_SCAN_INTERVAL = timedelta(seconds=15)
+DATA_INSTANCES = "entity_components"
 
 
-class EntityComponent(object):
-    """Helper class that will help a component manage its entities."""
+@bind_hass
+async def async_update_entity(hass: HomeAssistant, entity_id: str) -> None:
+    """Trigger an update for an entity."""
+    domain = entity_id.split(".", 1)[0]
+    entity_comp = hass.data.get(DATA_INSTANCES, {}).get(domain)
 
-    # pylint: disable=too-many-instance-attributes
-    # pylint: disable=too-many-arguments
-    def __init__(self, logger, domain, hass,
-                 scan_interval=DEFAULT_SCAN_INTERVAL, group_name=None):
+    if entity_comp is None:
+        logging.getLogger(__name__).warning(
+            "Forced update failed. Component for %s not loaded.", entity_id
+        )
+        return
+
+    entity_obj = entity_comp.get_entity(entity_id)
+
+    if entity_obj is None:
+        logging.getLogger(__name__).warning(
+            "Forced update failed. Entity %s not found.", entity_id
+        )
+        return
+
+    await entity_obj.async_update_ha_state(True)
+
+
+class EntityComponent:
+    """The EntityComponent manages platforms that manages entities.
+
+    This class has the following responsibilities:
+     - Process the configuration and set up a platform based component.
+     - Manage the platforms and their entities.
+     - Help extract the entities from a service call.
+     - Listen for discovery events for platforms related to the domain.
+    """
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        domain: str,
+        hass: HomeAssistant,
+        scan_interval: timedelta = DEFAULT_SCAN_INTERVAL,
+    ):
         """Initialize an entity component."""
         self.logger = logger
         self.hass = hass
-
         self.domain = domain
-        self.entity_id_format = domain + '.{}'
         self.scan_interval = scan_interval
-        self.group_name = group_name
 
-        self.entities = {}
-        self.group = None
+        self.config: Optional[ConfigType] = None
 
-        self.config = None
-        self.lock = Lock()
+        self._platforms: Dict[
+            Union[str, Tuple[str, Optional[timedelta], Optional[str]]], EntityPlatform
+        ] = {domain: self._async_init_entity_platform(domain, None)}
+        self.async_add_entities = self._platforms[domain].async_add_entities
+        self.add_entities = self._platforms[domain].add_entities
 
-        self._platforms = {
-            'core': EntityPlatform(self, self.scan_interval, None),
-        }
-        self.add_entities = self._platforms['core'].add_entities
+        hass.data.setdefault(DATA_INSTANCES, {})[domain] = self
 
-    def setup(self, config):
+    @property
+    def entities(self) -> Iterable[entity.Entity]:
+        """Return an iterable that returns all entities."""
+        return chain.from_iterable(
+            platform.entities.values() for platform in self._platforms.values()
+        )
+
+    def get_entity(self, entity_id: str) -> Optional[entity.Entity]:
+        """Get an entity."""
+        for platform in self._platforms.values():
+            entity_obj = platform.entities.get(entity_id)
+            if entity_obj is not None:
+                return entity_obj
+        return None
+
+    def setup(self, config: ConfigType) -> None:
+        """Set up a full entity component.
+
+        This doesn't block the executor to protect from deadlocks.
+        """
+        self.hass.add_job(self.async_setup(config))  # type: ignore
+
+    async def async_setup(self, config: ConfigType) -> None:
         """Set up a full entity component.
 
         Loads the platforms from the config and will listen for supported
         discovered platforms.
+
+        This method must be run in the event loop.
         """
         self.config = config
 
         # Look in config for Domain, Domain 2, Domain 3 etc and load them
         for p_type, p_config in config_per_platform(config, self.domain):
-            self._setup_platform(p_type, p_config)
+            self.hass.async_create_task(self.async_setup_platform(p_type, p_config))
 
         # Generic discovery listener for loading platform dynamically
-        # Refer to: homeassistant.components.discovery.load_platform()
-        def component_platform_discovered(platform, info):
-            """Callback to load a platform."""
-            self._setup_platform(platform, {}, info)
+        # Refer to: homeassistant.helpers.discovery.async_load_platform()
+        async def component_platform_discovered(
+            platform: str, info: Optional[Dict[str, Any]]
+        ) -> None:
+            """Handle the loading of a platform."""
+            await self.async_setup_platform(platform, {}, info)
 
-        discovery.listen_platform(self.hass, self.domain,
-                                  component_platform_discovered)
+        discovery.async_listen_platform(
+            self.hass, self.domain, component_platform_discovered
+        )
 
-    def extract_from_service(self, service):
-        """Extract all known entities from a service call.
+    async def async_setup_entry(self, config_entry: ConfigEntry) -> bool:
+        """Set up a config entry."""
+        platform_type = config_entry.domain
+        platform = await async_prepare_setup_platform(
+            self.hass,
+            # In future PR we should make hass_config part of the constructor
+            # params.
+            self.config or {},
+            self.domain,
+            platform_type,
+        )
 
-        Will return all entities if no entities specified in call.
+        if platform is None:
+            return False
+
+        key = config_entry.entry_id
+
+        if key in self._platforms:
+            raise ValueError("Config entry has already been setup!")
+
+        self._platforms[key] = self._async_init_entity_platform(
+            platform_type,
+            platform,
+            scan_interval=getattr(platform, "SCAN_INTERVAL", None),
+        )
+
+        return await self._platforms[key].async_setup_entry(config_entry)
+
+    async def async_unload_entry(self, config_entry: ConfigEntry) -> bool:
+        """Unload a config entry."""
+        key = config_entry.entry_id
+
+        platform = self._platforms.pop(key, None)
+
+        if platform is None:
+            raise ValueError("Config entry was never loaded!")
+
+        await platform.async_reset()
+        return True
+
+    async def async_extract_from_service(
+        self, service_call: ServiceCall, expand_group: bool = True
+    ) -> List[entity.Entity]:
+        """Extract all known and available entities from a service call.
+
         Will return an empty list if entities specified but unknown.
+
+        This method must be run in the event loop.
         """
-        with self.lock:
-            if ATTR_ENTITY_ID not in service.data:
-                return list(self.entities.values())
+        return await service.async_extract_entities(
+            self.hass, self.entities, service_call, expand_group
+        )
 
-            return [self.entities[entity_id] for entity_id
-                    in extract_entity_ids(self.hass, service)
-                    if entity_id in self.entities]
+    @callback
+    def async_register_entity_service(
+        self,
+        name: str,
+        schema: Union[Dict[str, Any], vol.Schema],
+        func: Union[str, Callable[..., Any]],
+        required_features: Optional[List[int]] = None,
+    ) -> None:
+        """Register an entity service."""
+        if isinstance(schema, dict):
+            schema = cv.make_entity_service_schema(schema)
 
-    def _setup_platform(self, platform_type, platform_config,
-                        discovery_info=None):
-        """Setup a platform for this component."""
-        platform = prepare_setup_platform(
-            self.hass, self.config, self.domain, platform_type)
+        async def handle_service(call: Callable) -> None:
+            """Handle the service."""
+            await self.hass.helpers.service.entity_service_call(
+                self._platforms.values(), func, call, required_features
+            )
+
+        self.hass.services.async_register(self.domain, name, handle_service, schema)
+
+    async def async_setup_platform(
+        self,
+        platform_type: str,
+        platform_config: ConfigType,
+        discovery_info: Optional[DiscoveryInfoType] = None,
+    ) -> None:
+        """Set up a platform for this component."""
+        if self.config is None:
+            raise RuntimeError("async_setup needs to be called first")
+
+        platform = await async_prepare_setup_platform(
+            self.hass, self.config, self.domain, platform_type
+        )
 
         if platform is None:
             return
 
-        # Config > Platform > Component
-        scan_interval = (platform_config.get(CONF_SCAN_INTERVAL) or
-                         getattr(platform, 'SCAN_INTERVAL', None) or
-                         self.scan_interval)
+        # Use config scan interval, fallback to platform if none set
+        scan_interval = platform_config.get(
+            CONF_SCAN_INTERVAL, getattr(platform, "SCAN_INTERVAL", None)
+        )
         entity_namespace = platform_config.get(CONF_ENTITY_NAMESPACE)
 
         key = (platform_type, scan_interval, entity_namespace)
 
         if key not in self._platforms:
-            self._platforms[key] = EntityPlatform(self, scan_interval,
-                                                  entity_namespace)
-        entity_platform = self._platforms[key]
+            self._platforms[key] = self._async_init_entity_platform(
+                platform_type, platform, scan_interval, entity_namespace
+            )
 
+        await self._platforms[key].async_setup(  # type: ignore
+            platform_config, discovery_info
+        )
+
+    async def _async_reset(self) -> None:
+        """Remove entities and reset the entity component to initial values.
+
+        This method must be run in the event loop.
+        """
+        tasks = []
+
+        for key, platform in self._platforms.items():
+            if key == self.domain:
+                tasks.append(platform.async_reset())
+            else:
+                tasks.append(platform.async_destroy())
+
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        self._platforms = {self.domain: self._platforms[self.domain]}
+        self.config = None
+
+    async def async_remove_entity(self, entity_id: str) -> None:
+        """Remove an entity managed by one of the platforms."""
+        found = None
+
+        for platform in self._platforms.values():
+            if entity_id in platform.entities:
+                found = platform
+                break
+
+        if found:
+            await found.async_remove_entity(entity_id)
+
+    async def async_prepare_reload(self, *, skip_reset: bool = False) -> Optional[dict]:
+        """Prepare reloading this entity component.
+
+        This method must be run in the event loop.
+        """
         try:
-            platform.setup_platform(self.hass, platform_config,
-                                    entity_platform.add_entities,
-                                    discovery_info)
-
-            self.hass.config.components.append(
-                '{}.{}'.format(self.domain, platform_type))
-        except Exception:  # pylint: disable=broad-except
-            self.logger.exception(
-                'Error while setting up platform %s', platform_type)
-
-    def add_entity(self, entity, platform=None):
-        """Add entity to component."""
-        if entity is None or entity in self.entities.values():
-            return False
-
-        entity.hass = self.hass
-
-        if getattr(entity, 'entity_id', None) is None:
-            object_id = entity.name or DEVICE_DEFAULT_NAME
-
-            if platform is not None and platform.entity_namespace is not None:
-                object_id = '{} {}'.format(platform.entity_namespace,
-                                           object_id)
-
-            entity.entity_id = generate_entity_id(
-                self.entity_id_format, object_id,
-                self.entities.keys())
-
-        self.entities[entity.entity_id] = entity
-        entity.update_ha_state()
-
-        return True
-
-    def update_group(self):
-        """Set up and/or update component group."""
-        if self.group is None and self.group_name is not None:
-            group = get_component('group')
-            self.group = group.Group(self.hass, self.group_name,
-                                     user_defined=False)
-
-        if self.group is not None:
-            self.group.update_tracked_entity_ids(self.entities.keys())
-
-    def reset(self):
-        """Remove entities and reset the entity component to initial values."""
-        with self.lock:
-            for platform in self._platforms.values():
-                platform.reset()
-
-            self._platforms = {
-                'core': self._platforms['core']
-            }
-            self.entities = {}
-            self.config = None
-
-            if self.group is not None:
-                self.group.stop()
-                self.group = None
-
-    def prepare_reload(self):
-        """Prepare reloading this entity component."""
-        try:
-            path = conf_util.find_config_file(self.hass.config.config_dir)
-            conf = conf_util.load_yaml_config_file(path)
+            conf = await conf_util.async_hass_config_yaml(self.hass)
         except HomeAssistantError as err:
             self.logger.error(err)
             return None
 
-        conf = prepare_setup_component(self.hass, conf, self.domain)
+        integration = await async_get_integration(self.hass, self.domain)
 
-        if conf is None:
+        processed_conf = await conf_util.async_process_component_config(
+            self.hass, conf, integration
+        )
+
+        if processed_conf is None:
             return None
 
-        self.reset()
-        return conf
+        if not skip_reset:
+            await self._async_reset()
 
+        return processed_conf
 
-class EntityPlatform(object):
-    """Keep track of entities for a single platform."""
+    @callback
+    def _async_init_entity_platform(
+        self,
+        platform_type: str,
+        platform: Optional[ModuleType],
+        scan_interval: Optional[timedelta] = None,
+        entity_namespace: Optional[str] = None,
+    ) -> EntityPlatform:
+        """Initialize an entity platform."""
+        if scan_interval is None:
+            scan_interval = self.scan_interval
 
-    # pylint: disable=too-few-public-methods
-    def __init__(self, component, scan_interval, entity_namespace):
-        """Initalize the entity platform."""
-        self.component = component
-        self.scan_interval = scan_interval
-        self.entity_namespace = entity_namespace
-        self.platform_entities = []
-        self._unsub_polling = None
-
-    def add_entities(self, new_entities):
-        """Add entities for a single platform."""
-        with self.component.lock:
-            for entity in new_entities:
-                if self.component.add_entity(entity, self):
-                    self.platform_entities.append(entity)
-
-            self.component.update_group()
-
-            if self._unsub_polling is not None or \
-               not any(entity.should_poll for entity
-                       in self.platform_entities):
-                return
-
-            self._unsub_polling = track_utc_time_change(
-                self.component.hass, self._update_entity_states,
-                second=range(0, 60, self.scan_interval))
-
-    def reset(self):
-        """Remove all entities and reset data."""
-        for entity in self.platform_entities:
-            entity.remove()
-        if self._unsub_polling is not None:
-            self._unsub_polling()
-            self._unsub_polling = None
-
-    def _update_entity_states(self, now):
-        """Update the states of all the polling entities."""
-        with self.component.lock:
-            # We copy the entities because new entities might be detected
-            # during state update causing deadlocks.
-            entities = list(entity for entity in self.platform_entities
-                            if entity.should_poll)
-
-        for entity in entities:
-            entity.update_ha_state(True)
+        return EntityPlatform(
+            hass=self.hass,
+            logger=self.logger,
+            domain=self.domain,
+            platform_name=platform_type,
+            platform=platform,
+            scan_interval=scan_interval,
+            entity_namespace=entity_namespace,
+        )

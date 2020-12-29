@@ -1,103 +1,151 @@
-"""
-Component to interface with various media players.
-
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/media_player/
-"""
+"""Component to interface with various media players."""
+import asyncio
+import base64
+import collections
+from datetime import timedelta
+import functools as ft
 import hashlib
 import logging
-import os
-import requests
+import secrets
+from typing import List, Optional, Tuple
+from urllib.parse import urlparse
 
+from aiohttp import web
+from aiohttp.hdrs import CACHE_CONTROL, CONTENT_TYPE
+from aiohttp.typedefs import LooseHeaders
+import async_timeout
 import voluptuous as vol
+from yarl import URL
 
-from homeassistant.config import load_yaml_config_file
+from homeassistant.components import websocket_api
+from homeassistant.components.http import KEY_AUTHENTICATED, HomeAssistantView
+from homeassistant.components.websocket_api.const import (
+    ERR_NOT_FOUND,
+    ERR_NOT_SUPPORTED,
+    ERR_UNKNOWN_ERROR,
+)
+from homeassistant.const import (
+    HTTP_INTERNAL_SERVER_ERROR,
+    HTTP_NOT_FOUND,
+    HTTP_OK,
+    HTTP_UNAUTHORIZED,
+    SERVICE_MEDIA_NEXT_TRACK,
+    SERVICE_MEDIA_PAUSE,
+    SERVICE_MEDIA_PLAY,
+    SERVICE_MEDIA_PLAY_PAUSE,
+    SERVICE_MEDIA_PREVIOUS_TRACK,
+    SERVICE_MEDIA_SEEK,
+    SERVICE_MEDIA_STOP,
+    SERVICE_REPEAT_SET,
+    SERVICE_SHUFFLE_SET,
+    SERVICE_TOGGLE,
+    SERVICE_TURN_OFF,
+    SERVICE_TURN_ON,
+    SERVICE_VOLUME_DOWN,
+    SERVICE_VOLUME_MUTE,
+    SERVICE_VOLUME_SET,
+    SERVICE_VOLUME_UP,
+    STATE_IDLE,
+    STATE_OFF,
+    STATE_PLAYING,
+)
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.config_validation import (  # noqa: F401
+    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA_BASE,
+)
 from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.entity_component import EntityComponent
-from homeassistant.helpers.config_validation import PLATFORM_SCHEMA  # noqa
-from homeassistant.components.http import HomeAssistantView
-import homeassistant.helpers.config_validation as cv
-from homeassistant.const import (
-    STATE_OFF, STATE_UNKNOWN, STATE_PLAYING, STATE_IDLE,
-    ATTR_ENTITY_ID, SERVICE_TURN_OFF, SERVICE_TURN_ON,
-    SERVICE_VOLUME_UP, SERVICE_VOLUME_DOWN, SERVICE_VOLUME_SET,
-    SERVICE_VOLUME_MUTE, SERVICE_TOGGLE, SERVICE_MEDIA_STOP,
-    SERVICE_MEDIA_PLAY_PAUSE, SERVICE_MEDIA_PLAY, SERVICE_MEDIA_PAUSE,
-    SERVICE_MEDIA_NEXT_TRACK, SERVICE_MEDIA_PREVIOUS_TRACK, SERVICE_MEDIA_SEEK)
+from homeassistant.helpers.network import get_url
+from homeassistant.loader import bind_hass
+
+from .const import (
+    ATTR_APP_ID,
+    ATTR_APP_NAME,
+    ATTR_INPUT_SOURCE,
+    ATTR_INPUT_SOURCE_LIST,
+    ATTR_MEDIA_ALBUM_ARTIST,
+    ATTR_MEDIA_ALBUM_NAME,
+    ATTR_MEDIA_ARTIST,
+    ATTR_MEDIA_CHANNEL,
+    ATTR_MEDIA_CONTENT_ID,
+    ATTR_MEDIA_CONTENT_TYPE,
+    ATTR_MEDIA_DURATION,
+    ATTR_MEDIA_ENQUEUE,
+    ATTR_MEDIA_EPISODE,
+    ATTR_MEDIA_EXTRA,
+    ATTR_MEDIA_PLAYLIST,
+    ATTR_MEDIA_POSITION,
+    ATTR_MEDIA_POSITION_UPDATED_AT,
+    ATTR_MEDIA_REPEAT,
+    ATTR_MEDIA_SEASON,
+    ATTR_MEDIA_SEEK_POSITION,
+    ATTR_MEDIA_SERIES_TITLE,
+    ATTR_MEDIA_SHUFFLE,
+    ATTR_MEDIA_TITLE,
+    ATTR_MEDIA_TRACK,
+    ATTR_MEDIA_VOLUME_LEVEL,
+    ATTR_MEDIA_VOLUME_MUTED,
+    ATTR_SOUND_MODE,
+    ATTR_SOUND_MODE_LIST,
+    DOMAIN,
+    MEDIA_CLASS_DIRECTORY,
+    REPEAT_MODES,
+    SERVICE_CLEAR_PLAYLIST,
+    SERVICE_PLAY_MEDIA,
+    SERVICE_SELECT_SOUND_MODE,
+    SERVICE_SELECT_SOURCE,
+    SUPPORT_BROWSE_MEDIA,
+    SUPPORT_CLEAR_PLAYLIST,
+    SUPPORT_NEXT_TRACK,
+    SUPPORT_PAUSE,
+    SUPPORT_PLAY,
+    SUPPORT_PLAY_MEDIA,
+    SUPPORT_PREVIOUS_TRACK,
+    SUPPORT_REPEAT_SET,
+    SUPPORT_SEEK,
+    SUPPORT_SELECT_SOUND_MODE,
+    SUPPORT_SELECT_SOURCE,
+    SUPPORT_SHUFFLE_SET,
+    SUPPORT_STOP,
+    SUPPORT_TURN_OFF,
+    SUPPORT_TURN_ON,
+    SUPPORT_VOLUME_MUTE,
+    SUPPORT_VOLUME_SET,
+    SUPPORT_VOLUME_STEP,
+)
+from .errors import BrowseError
+
+# mypy: allow-untyped-defs, no-check-untyped-defs
 
 _LOGGER = logging.getLogger(__name__)
 
-DOMAIN = 'media_player'
-DEPENDENCIES = ['http']
-SCAN_INTERVAL = 10
+ENTITY_ID_FORMAT = DOMAIN + ".{}"
 
-ENTITY_ID_FORMAT = DOMAIN + '.{}'
+CACHE_IMAGES = "images"
+CACHE_MAXSIZE = "maxsize"
+CACHE_LOCK = "lock"
+CACHE_URL = "url"
+CACHE_CONTENT = "content"
+ENTITY_IMAGE_CACHE = {CACHE_IMAGES: collections.OrderedDict(), CACHE_MAXSIZE: 16}
 
-ENTITY_IMAGE_URL = '/api/media_player_proxy/{0}?token={1}&cache={2}'
+SCAN_INTERVAL = timedelta(seconds=10)
 
-SERVICE_PLAY_MEDIA = 'play_media'
-SERVICE_SELECT_SOURCE = 'select_source'
-SERVICE_CLEAR_PLAYLIST = 'clear_playlist'
+DEVICE_CLASS_TV = "tv"
+DEVICE_CLASS_SPEAKER = "speaker"
+DEVICE_CLASS_RECEIVER = "receiver"
 
-ATTR_MEDIA_VOLUME_LEVEL = 'volume_level'
-ATTR_MEDIA_VOLUME_MUTED = 'is_volume_muted'
-ATTR_MEDIA_SEEK_POSITION = 'seek_position'
-ATTR_MEDIA_CONTENT_ID = 'media_content_id'
-ATTR_MEDIA_CONTENT_TYPE = 'media_content_type'
-ATTR_MEDIA_DURATION = 'media_duration'
-ATTR_MEDIA_TITLE = 'media_title'
-ATTR_MEDIA_ARTIST = 'media_artist'
-ATTR_MEDIA_ALBUM_NAME = 'media_album_name'
-ATTR_MEDIA_ALBUM_ARTIST = 'media_album_artist'
-ATTR_MEDIA_TRACK = 'media_track'
-ATTR_MEDIA_SERIES_TITLE = 'media_series_title'
-ATTR_MEDIA_SEASON = 'media_season'
-ATTR_MEDIA_EPISODE = 'media_episode'
-ATTR_MEDIA_CHANNEL = 'media_channel'
-ATTR_MEDIA_PLAYLIST = 'media_playlist'
-ATTR_APP_ID = 'app_id'
-ATTR_APP_NAME = 'app_name'
-ATTR_SUPPORTED_MEDIA_COMMANDS = 'supported_media_commands'
-ATTR_INPUT_SOURCE = 'source'
-ATTR_INPUT_SOURCE_LIST = 'source_list'
-ATTR_MEDIA_ENQUEUE = 'enqueue'
+DEVICE_CLASSES = [DEVICE_CLASS_TV, DEVICE_CLASS_SPEAKER, DEVICE_CLASS_RECEIVER]
 
-MEDIA_TYPE_MUSIC = 'music'
-MEDIA_TYPE_TVSHOW = 'tvshow'
-MEDIA_TYPE_VIDEO = 'movie'
-MEDIA_TYPE_EPISODE = 'episode'
-MEDIA_TYPE_CHANNEL = 'channel'
-MEDIA_TYPE_PLAYLIST = 'playlist'
+DEVICE_CLASSES_SCHEMA = vol.All(vol.Lower, vol.In(DEVICE_CLASSES))
 
-SUPPORT_PAUSE = 1
-SUPPORT_SEEK = 2
-SUPPORT_VOLUME_SET = 4
-SUPPORT_VOLUME_MUTE = 8
-SUPPORT_PREVIOUS_TRACK = 16
-SUPPORT_NEXT_TRACK = 32
 
-SUPPORT_TURN_ON = 128
-SUPPORT_TURN_OFF = 256
-SUPPORT_PLAY_MEDIA = 512
-SUPPORT_VOLUME_STEP = 1024
-SUPPORT_SELECT_SOURCE = 2048
-SUPPORT_STOP = 4096
-SUPPORT_CLEAR_PLAYLIST = 8192
-
-# simple services that only take entity_id(s) as optional argument
-SERVICE_TO_METHOD = {
-    SERVICE_TURN_ON: 'turn_on',
-    SERVICE_TURN_OFF: 'turn_off',
-    SERVICE_TOGGLE: 'toggle',
-    SERVICE_VOLUME_UP: 'volume_up',
-    SERVICE_VOLUME_DOWN: 'volume_down',
-    SERVICE_MEDIA_PLAY_PAUSE: 'media_play_pause',
-    SERVICE_MEDIA_PLAY: 'media_play',
-    SERVICE_MEDIA_PAUSE: 'media_pause',
-    SERVICE_MEDIA_STOP: 'media_stop',
-    SERVICE_MEDIA_NEXT_TRACK: 'media_next_track',
-    SERVICE_MEDIA_PREVIOUS_TRACK: 'media_previous_track',
-    SERVICE_CLEAR_PLAYLIST: 'clear_playlist'
+MEDIA_PLAYER_PLAY_MEDIA_SCHEMA = {
+    vol.Required(ATTR_MEDIA_CONTENT_TYPE): cv.string,
+    vol.Required(ATTR_MEDIA_CONTENT_ID): cv.string,
+    vol.Optional(ATTR_MEDIA_ENQUEUE): cv.boolean,
+    vol.Optional(ATTR_MEDIA_EXTRA, default={}): dict,
 }
 
 ATTR_TO_PROPERTY = [
@@ -106,6 +154,8 @@ ATTR_TO_PROPERTY = [
     ATTR_MEDIA_CONTENT_ID,
     ATTR_MEDIA_CONTENT_TYPE,
     ATTR_MEDIA_DURATION,
+    ATTR_MEDIA_POSITION,
+    ATTR_MEDIA_POSITION_UPDATED_AT,
     ATTR_MEDIA_TITLE,
     ATTR_MEDIA_ARTIST,
     ATTR_MEDIA_ALBUM_NAME,
@@ -118,40 +168,14 @@ ATTR_TO_PROPERTY = [
     ATTR_MEDIA_PLAYLIST,
     ATTR_APP_ID,
     ATTR_APP_NAME,
-    ATTR_SUPPORTED_MEDIA_COMMANDS,
     ATTR_INPUT_SOURCE,
-    ATTR_INPUT_SOURCE_LIST,
+    ATTR_SOUND_MODE,
+    ATTR_MEDIA_SHUFFLE,
+    ATTR_MEDIA_REPEAT,
 ]
 
-# Service call validation schemas
-MEDIA_PLAYER_SCHEMA = vol.Schema({
-    ATTR_ENTITY_ID: cv.entity_ids,
-})
 
-MEDIA_PLAYER_MUTE_VOLUME_SCHEMA = MEDIA_PLAYER_SCHEMA.extend({
-    vol.Required(ATTR_MEDIA_VOLUME_MUTED): cv.boolean,
-})
-
-MEDIA_PLAYER_SET_VOLUME_SCHEMA = MEDIA_PLAYER_SCHEMA.extend({
-    vol.Required(ATTR_MEDIA_VOLUME_LEVEL): cv.small_float,
-})
-
-MEDIA_PLAYER_MEDIA_SEEK_SCHEMA = MEDIA_PLAYER_SCHEMA.extend({
-    vol.Required(ATTR_MEDIA_SEEK_POSITION):
-        vol.All(vol.Coerce(float), vol.Range(min=0)),
-})
-
-MEDIA_PLAYER_PLAY_MEDIA_SCHEMA = MEDIA_PLAYER_SCHEMA.extend({
-    vol.Required(ATTR_MEDIA_CONTENT_TYPE): cv.string,
-    vol.Required(ATTR_MEDIA_CONTENT_ID): cv.string,
-    ATTR_MEDIA_ENQUEUE: cv.boolean,
-})
-
-MEDIA_PLAYER_SELECT_SOURCE_SCHEMA = MEDIA_PLAYER_SCHEMA.extend({
-    vol.Required(ATTR_INPUT_SOURCE): cv.string,
-})
-
-
+@bind_hass
 def is_on(hass, entity_id=None):
     """
     Return true if specified media player entity_id is on.
@@ -159,256 +183,190 @@ def is_on(hass, entity_id=None):
     Check all media player if no entity_id specified.
     """
     entity_ids = [entity_id] if entity_id else hass.states.entity_ids(DOMAIN)
-    return any(not hass.states.is_state(entity_id, STATE_OFF)
-               for entity_id in entity_ids)
+    return any(
+        not hass.states.is_state(entity_id, STATE_OFF) for entity_id in entity_ids
+    )
 
 
-def turn_on(hass, entity_id=None):
-    """Turn on specified media player or all."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
-    hass.services.call(DOMAIN, SERVICE_TURN_ON, data)
+def _rename_keys(**keys):
+    """Create validator that renames keys.
+
+    Necessary because the service schema names do not match the command parameters.
+
+    Async friendly.
+    """
+
+    def rename(value):
+        for to_key, from_key in keys.items():
+            if from_key in value:
+                value[to_key] = value.pop(from_key)
+        return value
+
+    return rename
 
 
-def turn_off(hass, entity_id=None):
-    """Turn off specified media player or all."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
-    hass.services.call(DOMAIN, SERVICE_TURN_OFF, data)
-
-
-def toggle(hass, entity_id=None):
-    """Toggle specified media player or all."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
-    hass.services.call(DOMAIN, SERVICE_TOGGLE, data)
-
-
-def volume_up(hass, entity_id=None):
-    """Send the media player the command for volume up."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
-    hass.services.call(DOMAIN, SERVICE_VOLUME_UP, data)
-
-
-def volume_down(hass, entity_id=None):
-    """Send the media player the command for volume down."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
-    hass.services.call(DOMAIN, SERVICE_VOLUME_DOWN, data)
-
-
-def mute_volume(hass, mute, entity_id=None):
-    """Send the media player the command for muting the volume."""
-    data = {ATTR_MEDIA_VOLUME_MUTED: mute}
-
-    if entity_id:
-        data[ATTR_ENTITY_ID] = entity_id
-
-    hass.services.call(DOMAIN, SERVICE_VOLUME_MUTE, data)
-
-
-def set_volume_level(hass, volume, entity_id=None):
-    """Send the media player the command for setting the volume."""
-    data = {ATTR_MEDIA_VOLUME_LEVEL: volume}
-
-    if entity_id:
-        data[ATTR_ENTITY_ID] = entity_id
-
-    hass.services.call(DOMAIN, SERVICE_VOLUME_SET, data)
-
-
-def media_play_pause(hass, entity_id=None):
-    """Send the media player the command for play/pause."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
-    hass.services.call(DOMAIN, SERVICE_MEDIA_PLAY_PAUSE, data)
-
-
-def media_play(hass, entity_id=None):
-    """Send the media player the command for play/pause."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
-    hass.services.call(DOMAIN, SERVICE_MEDIA_PLAY, data)
-
-
-def media_pause(hass, entity_id=None):
-    """Send the media player the command for pause."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
-    hass.services.call(DOMAIN, SERVICE_MEDIA_PAUSE, data)
-
-
-def media_stop(hass, entity_id=None):
-    """Send the media player the stop command."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
-    hass.services.call(DOMAIN, SERVICE_MEDIA_STOP, data)
-
-
-def media_next_track(hass, entity_id=None):
-    """Send the media player the command for next track."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
-    hass.services.call(DOMAIN, SERVICE_MEDIA_NEXT_TRACK, data)
-
-
-def media_previous_track(hass, entity_id=None):
-    """Send the media player the command for prev track."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
-    hass.services.call(DOMAIN, SERVICE_MEDIA_PREVIOUS_TRACK, data)
-
-
-def media_seek(hass, position, entity_id=None):
-    """Send the media player the command to seek in current playing media."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
-    data[ATTR_MEDIA_SEEK_POSITION] = position
-    hass.services.call(DOMAIN, SERVICE_MEDIA_SEEK, data)
-
-
-def play_media(hass, media_type, media_id, entity_id=None, enqueue=None):
-    """Send the media player the command for playing media."""
-    data = {ATTR_MEDIA_CONTENT_TYPE: media_type,
-            ATTR_MEDIA_CONTENT_ID: media_id}
-
-    if entity_id:
-        data[ATTR_ENTITY_ID] = entity_id
-
-    if enqueue:
-        data[ATTR_MEDIA_ENQUEUE] = enqueue
-
-    hass.services.call(DOMAIN, SERVICE_PLAY_MEDIA, data)
-
-
-def select_source(hass, source, entity_id=None):
-    """Send the media player the command to select input source."""
-    data = {ATTR_INPUT_SOURCE: source}
-
-    if entity_id:
-        data[ATTR_ENTITY_ID] = entity_id
-
-    hass.services.call(DOMAIN, SERVICE_SELECT_SOURCE, data)
-
-
-def clear_playlist(hass, entity_id=None):
-    """Send the media player the command for clear playlist."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
-    hass.services.call(DOMAIN, SERVICE_CLEAR_PLAYLIST, data)
-
-
-def setup(hass, config):
+async def async_setup(hass, config):
     """Track states and offer events for media_players."""
-    component = EntityComponent(
-        logging.getLogger(__name__), DOMAIN, hass, SCAN_INTERVAL)
+    component = hass.data[DOMAIN] = EntityComponent(
+        logging.getLogger(__name__), DOMAIN, hass, SCAN_INTERVAL
+    )
 
-    hass.wsgi.register_view(MediaPlayerImageView(hass, component.entities))
+    hass.components.websocket_api.async_register_command(websocket_handle_thumbnail)
+    hass.components.websocket_api.async_register_command(websocket_browse_media)
+    hass.http.register_view(MediaPlayerImageView(component))
 
-    component.setup(config)
+    await component.async_setup(config)
 
-    descriptions = load_yaml_config_file(
-        os.path.join(os.path.dirname(__file__), 'services.yaml'))
+    component.async_register_entity_service(
+        SERVICE_TURN_ON, {}, "async_turn_on", [SUPPORT_TURN_ON]
+    )
+    component.async_register_entity_service(
+        SERVICE_TURN_OFF, {}, "async_turn_off", [SUPPORT_TURN_OFF]
+    )
+    component.async_register_entity_service(
+        SERVICE_TOGGLE, {}, "async_toggle", [SUPPORT_TURN_OFF | SUPPORT_TURN_ON]
+    )
+    component.async_register_entity_service(
+        SERVICE_VOLUME_UP,
+        {},
+        "async_volume_up",
+        [SUPPORT_VOLUME_SET, SUPPORT_VOLUME_STEP],
+    )
+    component.async_register_entity_service(
+        SERVICE_VOLUME_DOWN,
+        {},
+        "async_volume_down",
+        [SUPPORT_VOLUME_SET, SUPPORT_VOLUME_STEP],
+    )
+    component.async_register_entity_service(
+        SERVICE_MEDIA_PLAY_PAUSE,
+        {},
+        "async_media_play_pause",
+        [SUPPORT_PLAY | SUPPORT_PAUSE],
+    )
+    component.async_register_entity_service(
+        SERVICE_MEDIA_PLAY, {}, "async_media_play", [SUPPORT_PLAY]
+    )
+    component.async_register_entity_service(
+        SERVICE_MEDIA_PAUSE, {}, "async_media_pause", [SUPPORT_PAUSE]
+    )
+    component.async_register_entity_service(
+        SERVICE_MEDIA_STOP, {}, "async_media_stop", [SUPPORT_STOP]
+    )
+    component.async_register_entity_service(
+        SERVICE_MEDIA_NEXT_TRACK, {}, "async_media_next_track", [SUPPORT_NEXT_TRACK]
+    )
+    component.async_register_entity_service(
+        SERVICE_MEDIA_PREVIOUS_TRACK,
+        {},
+        "async_media_previous_track",
+        [SUPPORT_PREVIOUS_TRACK],
+    )
+    component.async_register_entity_service(
+        SERVICE_CLEAR_PLAYLIST, {}, "async_clear_playlist", [SUPPORT_CLEAR_PLAYLIST]
+    )
+    component.async_register_entity_service(
+        SERVICE_VOLUME_SET,
+        vol.All(
+            cv.make_entity_service_schema(
+                {vol.Required(ATTR_MEDIA_VOLUME_LEVEL): cv.small_float}
+            ),
+            _rename_keys(volume=ATTR_MEDIA_VOLUME_LEVEL),
+        ),
+        "async_set_volume_level",
+        [SUPPORT_VOLUME_SET],
+    )
+    component.async_register_entity_service(
+        SERVICE_VOLUME_MUTE,
+        vol.All(
+            cv.make_entity_service_schema(
+                {vol.Required(ATTR_MEDIA_VOLUME_MUTED): cv.boolean}
+            ),
+            _rename_keys(mute=ATTR_MEDIA_VOLUME_MUTED),
+        ),
+        "async_mute_volume",
+        [SUPPORT_VOLUME_MUTE],
+    )
+    component.async_register_entity_service(
+        SERVICE_MEDIA_SEEK,
+        vol.All(
+            cv.make_entity_service_schema(
+                {vol.Required(ATTR_MEDIA_SEEK_POSITION): cv.positive_float}
+            ),
+            _rename_keys(position=ATTR_MEDIA_SEEK_POSITION),
+        ),
+        "async_media_seek",
+        [SUPPORT_SEEK],
+    )
+    component.async_register_entity_service(
+        SERVICE_SELECT_SOURCE,
+        {vol.Required(ATTR_INPUT_SOURCE): cv.string},
+        "async_select_source",
+        [SUPPORT_SELECT_SOURCE],
+    )
+    component.async_register_entity_service(
+        SERVICE_SELECT_SOUND_MODE,
+        {vol.Required(ATTR_SOUND_MODE): cv.string},
+        "async_select_sound_mode",
+        [SUPPORT_SELECT_SOUND_MODE],
+    )
+    component.async_register_entity_service(
+        SERVICE_PLAY_MEDIA,
+        vol.All(
+            cv.make_entity_service_schema(MEDIA_PLAYER_PLAY_MEDIA_SCHEMA),
+            _rename_keys(
+                media_type=ATTR_MEDIA_CONTENT_TYPE,
+                media_id=ATTR_MEDIA_CONTENT_ID,
+                enqueue=ATTR_MEDIA_ENQUEUE,
+            ),
+        ),
+        "async_play_media",
+        [SUPPORT_PLAY_MEDIA],
+    )
+    component.async_register_entity_service(
+        SERVICE_SHUFFLE_SET,
+        {vol.Required(ATTR_MEDIA_SHUFFLE): cv.boolean},
+        "async_set_shuffle",
+        [SUPPORT_SHUFFLE_SET],
+    )
 
-    def media_player_service_handler(service):
-        """Map services to methods on MediaPlayerDevice."""
-        method = SERVICE_TO_METHOD[service.service]
-
-        for player in component.extract_from_service(service):
-            getattr(player, method)()
-
-            if player.should_poll:
-                player.update_ha_state(True)
-
-    for service in SERVICE_TO_METHOD:
-        hass.services.register(DOMAIN, service, media_player_service_handler,
-                               descriptions.get(service),
-                               schema=MEDIA_PLAYER_SCHEMA)
-
-    def volume_set_service(service):
-        """Set specified volume on the media player."""
-        volume = service.data.get(ATTR_MEDIA_VOLUME_LEVEL)
-
-        for player in component.extract_from_service(service):
-            player.set_volume_level(volume)
-
-            if player.should_poll:
-                player.update_ha_state(True)
-
-    hass.services.register(DOMAIN, SERVICE_VOLUME_SET, volume_set_service,
-                           descriptions.get(SERVICE_VOLUME_SET),
-                           schema=MEDIA_PLAYER_SET_VOLUME_SCHEMA)
-
-    def volume_mute_service(service):
-        """Mute (true) or unmute (false) the media player."""
-        mute = service.data.get(ATTR_MEDIA_VOLUME_MUTED)
-
-        for player in component.extract_from_service(service):
-            player.mute_volume(mute)
-
-            if player.should_poll:
-                player.update_ha_state(True)
-
-    hass.services.register(DOMAIN, SERVICE_VOLUME_MUTE, volume_mute_service,
-                           descriptions.get(SERVICE_VOLUME_MUTE),
-                           schema=MEDIA_PLAYER_MUTE_VOLUME_SCHEMA)
-
-    def media_seek_service(service):
-        """Seek to a position."""
-        position = service.data.get(ATTR_MEDIA_SEEK_POSITION)
-
-        for player in component.extract_from_service(service):
-            player.media_seek(position)
-
-            if player.should_poll:
-                player.update_ha_state(True)
-
-    hass.services.register(DOMAIN, SERVICE_MEDIA_SEEK, media_seek_service,
-                           descriptions.get(SERVICE_MEDIA_SEEK),
-                           schema=MEDIA_PLAYER_MEDIA_SEEK_SCHEMA)
-
-    def select_source_service(service):
-        """Change input to selected source."""
-        input_source = service.data.get(ATTR_INPUT_SOURCE)
-
-        for player in component.extract_from_service(service):
-            player.select_source(input_source)
-
-            if player.should_poll:
-                player.update_ha_state(True)
-
-    hass.services.register(DOMAIN, SERVICE_SELECT_SOURCE,
-                           select_source_service,
-                           descriptions.get(SERVICE_SELECT_SOURCE),
-                           schema=MEDIA_PLAYER_SELECT_SOURCE_SCHEMA)
-
-    def play_media_service(service):
-        """Play specified media_id on the media player."""
-        media_type = service.data.get(ATTR_MEDIA_CONTENT_TYPE)
-        media_id = service.data.get(ATTR_MEDIA_CONTENT_ID)
-        enqueue = service.data.get(ATTR_MEDIA_ENQUEUE)
-
-        kwargs = {
-            ATTR_MEDIA_ENQUEUE: enqueue,
-        }
-
-        for player in component.extract_from_service(service):
-            player.play_media(media_type, media_id, **kwargs)
-
-            if player.should_poll:
-                player.update_ha_state(True)
-
-    hass.services.register(DOMAIN, SERVICE_PLAY_MEDIA, play_media_service,
-                           descriptions.get(SERVICE_PLAY_MEDIA),
-                           schema=MEDIA_PLAYER_PLAY_MEDIA_SCHEMA)
+    component.async_register_entity_service(
+        SERVICE_REPEAT_SET,
+        {vol.Required(ATTR_MEDIA_REPEAT): vol.In(REPEAT_MODES)},
+        "async_set_repeat",
+        [SUPPORT_REPEAT_SET],
+    )
 
     return True
 
 
-class MediaPlayerDevice(Entity):
-    """ABC for media player devices."""
+async def async_setup_entry(hass, entry):
+    """Set up a config entry."""
+    return await hass.data[DOMAIN].async_setup_entry(entry)
 
-    # pylint: disable=too-many-public-methods,no-self-use
+
+async def async_unload_entry(hass, entry):
+    """Unload a config entry."""
+    return await hass.data[DOMAIN].async_unload_entry(entry)
+
+
+class MediaPlayerEntity(Entity):
+    """ABC for media player entities."""
+
+    _access_token: Optional[str] = None
 
     # Implement these for your media player
-
     @property
     def state(self):
         """State of the player."""
-        return STATE_UNKNOWN
+        return None
 
     @property
-    def access_token(self):
+    def access_token(self) -> str:
         """Access token for this media player."""
-        return str(id(self))
+        if self._access_token is None:
+            self._access_token = secrets.token_hex(32)
+        return self._access_token
 
     @property
     def volume_level(self):
@@ -436,9 +394,57 @@ class MediaPlayerDevice(Entity):
         return None
 
     @property
+    def media_position(self):
+        """Position of current playing media in seconds."""
+        return None
+
+    @property
+    def media_position_updated_at(self):
+        """When was the position of the current playing media valid.
+
+        Returns value from homeassistant.util.dt.utcnow().
+        """
+        return None
+
+    @property
     def media_image_url(self):
         """Image url of current playing media."""
         return None
+
+    @property
+    def media_image_remotely_accessible(self) -> bool:
+        """If the image url is remotely accessible."""
+        return False
+
+    @property
+    def media_image_hash(self):
+        """Hash value for media image."""
+        url = self.media_image_url
+        if url is not None:
+            return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+
+        return None
+
+    async def async_get_media_image(self):
+        """Fetch media image of current playing image."""
+        url = self.media_image_url
+        if url is None:
+            return None, None
+
+        return await self._async_fetch_image_from_cache(url)
+
+    async def async_get_browse_image(
+        self,
+        media_content_type: str,
+        media_content_id: str,
+        media_image_id: Optional[str] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Optionally fetch internally accessible image for media browser.
+
+        Must be implemented by integration.
+        """
+        return None, None
 
     @property
     def media_title(self):
@@ -511,136 +517,275 @@ class MediaPlayerDevice(Entity):
         return None
 
     @property
-    def supported_media_commands(self):
-        """Flag media commands that are supported."""
+    def sound_mode(self):
+        """Name of the current sound mode."""
+        return None
+
+    @property
+    def sound_mode_list(self):
+        """List of available sound modes."""
+        return None
+
+    @property
+    def shuffle(self):
+        """Boolean if shuffle is enabled."""
+        return None
+
+    @property
+    def repeat(self):
+        """Return current repeat mode."""
+        return None
+
+    @property
+    def supported_features(self):
+        """Flag media player features that are supported."""
         return 0
 
     def turn_on(self):
         """Turn the media player on."""
         raise NotImplementedError()
 
+    async def async_turn_on(self):
+        """Turn the media player on."""
+        await self.hass.async_add_executor_job(self.turn_on)
+
     def turn_off(self):
         """Turn the media player off."""
         raise NotImplementedError()
+
+    async def async_turn_off(self):
+        """Turn the media player off."""
+        await self.hass.async_add_executor_job(self.turn_off)
 
     def mute_volume(self, mute):
         """Mute the volume."""
         raise NotImplementedError()
 
+    async def async_mute_volume(self, mute):
+        """Mute the volume."""
+        await self.hass.async_add_executor_job(self.mute_volume, mute)
+
     def set_volume_level(self, volume):
         """Set volume level, range 0..1."""
         raise NotImplementedError()
 
+    async def async_set_volume_level(self, volume):
+        """Set volume level, range 0..1."""
+        await self.hass.async_add_executor_job(self.set_volume_level, volume)
+
     def media_play(self):
-        """Send play commmand."""
+        """Send play command."""
         raise NotImplementedError()
+
+    async def async_media_play(self):
+        """Send play command."""
+        await self.hass.async_add_executor_job(self.media_play)
 
     def media_pause(self):
         """Send pause command."""
         raise NotImplementedError()
 
+    async def async_media_pause(self):
+        """Send pause command."""
+        await self.hass.async_add_executor_job(self.media_pause)
+
     def media_stop(self):
         """Send stop command."""
         raise NotImplementedError()
+
+    async def async_media_stop(self):
+        """Send stop command."""
+        await self.hass.async_add_executor_job(self.media_stop)
 
     def media_previous_track(self):
         """Send previous track command."""
         raise NotImplementedError()
 
+    async def async_media_previous_track(self):
+        """Send previous track command."""
+        await self.hass.async_add_executor_job(self.media_previous_track)
+
     def media_next_track(self):
         """Send next track command."""
         raise NotImplementedError()
+
+    async def async_media_next_track(self):
+        """Send next track command."""
+        await self.hass.async_add_executor_job(self.media_next_track)
 
     def media_seek(self, position):
         """Send seek command."""
         raise NotImplementedError()
 
-    def play_media(self, media_type, media_id):
+    async def async_media_seek(self, position):
+        """Send seek command."""
+        await self.hass.async_add_executor_job(self.media_seek, position)
+
+    def play_media(self, media_type, media_id, **kwargs):
         """Play a piece of media."""
         raise NotImplementedError()
+
+    async def async_play_media(self, media_type, media_id, **kwargs):
+        """Play a piece of media."""
+        await self.hass.async_add_executor_job(
+            ft.partial(self.play_media, media_type, media_id, **kwargs)
+        )
 
     def select_source(self, source):
         """Select input source."""
         raise NotImplementedError()
 
+    async def async_select_source(self, source):
+        """Select input source."""
+        await self.hass.async_add_executor_job(self.select_source, source)
+
+    def select_sound_mode(self, sound_mode):
+        """Select sound mode."""
+        raise NotImplementedError()
+
+    async def async_select_sound_mode(self, sound_mode):
+        """Select sound mode."""
+        await self.hass.async_add_executor_job(self.select_sound_mode, sound_mode)
+
     def clear_playlist(self):
         """Clear players playlist."""
         raise NotImplementedError()
 
+    async def async_clear_playlist(self):
+        """Clear players playlist."""
+        await self.hass.async_add_executor_job(self.clear_playlist)
+
+    def set_shuffle(self, shuffle):
+        """Enable/disable shuffle mode."""
+        raise NotImplementedError()
+
+    async def async_set_shuffle(self, shuffle):
+        """Enable/disable shuffle mode."""
+        await self.hass.async_add_executor_job(self.set_shuffle, shuffle)
+
+    def set_repeat(self, repeat):
+        """Set repeat mode."""
+        raise NotImplementedError()
+
+    async def async_set_repeat(self, repeat):
+        """Set repeat mode."""
+        await self.hass.async_add_executor_job(self.set_repeat, repeat)
+
     # No need to overwrite these.
+    @property
+    def support_play(self):
+        """Boolean if play is supported."""
+        return bool(self.supported_features & SUPPORT_PLAY)
+
     @property
     def support_pause(self):
         """Boolean if pause is supported."""
-        return bool(self.supported_media_commands & SUPPORT_PAUSE)
+        return bool(self.supported_features & SUPPORT_PAUSE)
 
     @property
     def support_stop(self):
         """Boolean if stop is supported."""
-        return bool(self.supported_media_commands & SUPPORT_STOP)
+        return bool(self.supported_features & SUPPORT_STOP)
 
     @property
     def support_seek(self):
         """Boolean if seek is supported."""
-        return bool(self.supported_media_commands & SUPPORT_SEEK)
+        return bool(self.supported_features & SUPPORT_SEEK)
 
     @property
     def support_volume_set(self):
         """Boolean if setting volume is supported."""
-        return bool(self.supported_media_commands & SUPPORT_VOLUME_SET)
+        return bool(self.supported_features & SUPPORT_VOLUME_SET)
 
     @property
     def support_volume_mute(self):
         """Boolean if muting volume is supported."""
-        return bool(self.supported_media_commands & SUPPORT_VOLUME_MUTE)
+        return bool(self.supported_features & SUPPORT_VOLUME_MUTE)
 
     @property
     def support_previous_track(self):
         """Boolean if previous track command supported."""
-        return bool(self.supported_media_commands & SUPPORT_PREVIOUS_TRACK)
+        return bool(self.supported_features & SUPPORT_PREVIOUS_TRACK)
 
     @property
     def support_next_track(self):
         """Boolean if next track command supported."""
-        return bool(self.supported_media_commands & SUPPORT_NEXT_TRACK)
+        return bool(self.supported_features & SUPPORT_NEXT_TRACK)
 
     @property
     def support_play_media(self):
         """Boolean if play media command supported."""
-        return bool(self.supported_media_commands & SUPPORT_PLAY_MEDIA)
+        return bool(self.supported_features & SUPPORT_PLAY_MEDIA)
 
     @property
     def support_select_source(self):
         """Boolean if select source command supported."""
-        return bool(self.supported_media_commands & SUPPORT_SELECT_SOURCE)
+        return bool(self.supported_features & SUPPORT_SELECT_SOURCE)
+
+    @property
+    def support_select_sound_mode(self):
+        """Boolean if select sound mode command supported."""
+        return bool(self.supported_features & SUPPORT_SELECT_SOUND_MODE)
 
     @property
     def support_clear_playlist(self):
         """Boolean if clear playlist command supported."""
-        return bool(self.supported_media_commands & SUPPORT_CLEAR_PLAYLIST)
+        return bool(self.supported_features & SUPPORT_CLEAR_PLAYLIST)
 
-    def toggle(self):
+    @property
+    def support_shuffle_set(self):
+        """Boolean if shuffle is supported."""
+        return bool(self.supported_features & SUPPORT_SHUFFLE_SET)
+
+    async def async_toggle(self):
         """Toggle the power on the media player."""
+        if hasattr(self, "toggle"):
+            # pylint: disable=no-member
+            await self.hass.async_add_executor_job(self.toggle)
+            return
+
         if self.state in [STATE_OFF, STATE_IDLE]:
-            self.turn_on()
+            await self.async_turn_on()
         else:
-            self.turn_off()
+            await self.async_turn_off()
 
-    def volume_up(self):
-        """Turn volume up for media player."""
-        if self.volume_level < 1:
-            self.set_volume_level(min(1, self.volume_level + .1))
+    async def async_volume_up(self):
+        """Turn volume up for media player.
 
-    def volume_down(self):
-        """Turn volume down for media player."""
-        if self.volume_level > 0:
-            self.set_volume_level(max(0, self.volume_level - .1))
+        This method is a coroutine.
+        """
+        if hasattr(self, "volume_up"):
+            # pylint: disable=no-member
+            await self.hass.async_add_executor_job(self.volume_up)
+            return
 
-    def media_play_pause(self):
+        if self.volume_level < 1 and self.supported_features & SUPPORT_VOLUME_SET:
+            await self.async_set_volume_level(min(1, self.volume_level + 0.1))
+
+    async def async_volume_down(self):
+        """Turn volume down for media player.
+
+        This method is a coroutine.
+        """
+        if hasattr(self, "volume_down"):
+            # pylint: disable=no-member
+            await self.hass.async_add_executor_job(self.volume_down)
+            return
+
+        if self.volume_level > 0 and self.supported_features & SUPPORT_VOLUME_SET:
+            await self.async_set_volume_level(max(0, self.volume_level - 0.1))
+
+    async def async_media_play_pause(self):
         """Play or pause the media player."""
+        if hasattr(self, "media_play_pause"):
+            # pylint: disable=no-member
+            await self.hass.async_add_executor_job(self.media_play_pause)
+            return
+
         if self.state == STATE_PLAYING:
-            self.media_pause()
+            await self.async_media_pause()
         else:
-            self.media_play()
+            await self.async_media_play()
 
     @property
     def entity_picture(self):
@@ -648,63 +793,380 @@ class MediaPlayerDevice(Entity):
         if self.state == STATE_OFF:
             return None
 
-        url = self.media_image_url
+        if self.media_image_remotely_accessible:
+            return self.media_image_url
 
-        if url is None:
+        return self.media_image_local
+
+    @property
+    def media_image_local(self):
+        """Return local url to media image."""
+        image_hash = self.media_image_hash
+
+        if image_hash is None:
             return None
 
-        return ENTITY_IMAGE_URL.format(
-            self.entity_id, self.access_token,
-            hashlib.md5(url.encode('utf-8')).hexdigest()[:5])
+        return (
+            f"/api/media_player_proxy/{self.entity_id}?"
+            f"token={self.access_token}&cache={image_hash}"
+        )
+
+    @property
+    def capability_attributes(self):
+        """Return capability attributes."""
+        supported_features = self.supported_features or 0
+        data = {}
+
+        if supported_features & SUPPORT_SELECT_SOURCE:
+            source_list = self.source_list
+            if source_list:
+                data[ATTR_INPUT_SOURCE_LIST] = source_list
+
+        if supported_features & SUPPORT_SELECT_SOUND_MODE:
+            sound_mode_list = self.sound_mode_list
+            if sound_mode_list:
+                data[ATTR_SOUND_MODE_LIST] = sound_mode_list
+
+        return data
 
     @property
     def state_attributes(self):
         """Return the state attributes."""
         if self.state == STATE_OFF:
-            state_attr = {
-                ATTR_SUPPORTED_MEDIA_COMMANDS: self.supported_media_commands,
-            }
-        else:
-            state_attr = {
-                attr: getattr(self, attr) for attr
-                in ATTR_TO_PROPERTY if getattr(self, attr) is not None
-            }
+            return None
+
+        state_attr = {}
+
+        for attr in ATTR_TO_PROPERTY:
+            value = getattr(self, attr)
+            if value is not None:
+                state_attr[attr] = value
+
+        if self.media_image_remotely_accessible:
+            state_attr["entity_picture_local"] = self.media_image_local
 
         return state_attr
+
+    async def async_browse_media(
+        self,
+        media_content_type: Optional[str] = None,
+        media_content_id: Optional[str] = None,
+    ) -> "BrowseMedia":
+        """Return a BrowseMedia instance.
+
+        The BrowseMedia instance will be used by the
+        "media_player/browse_media" websocket command.
+        """
+        raise NotImplementedError()
+
+    async def _async_fetch_image_from_cache(self, url):
+        """Fetch image.
+
+        Images are cached in memory (the images are typically 10-100kB in size).
+        """
+        cache_images = ENTITY_IMAGE_CACHE[CACHE_IMAGES]
+        cache_maxsize = ENTITY_IMAGE_CACHE[CACHE_MAXSIZE]
+
+        if urlparse(url).hostname is None:
+            url = f"{get_url(self.hass)}{url}"
+
+        if url not in cache_images:
+            cache_images[url] = {CACHE_LOCK: asyncio.Lock()}
+
+        async with cache_images[url][CACHE_LOCK]:
+            if CACHE_CONTENT in cache_images[url]:
+                return cache_images[url][CACHE_CONTENT]
+
+        (content, content_type) = await self._async_fetch_image(url)
+
+        async with cache_images[url][CACHE_LOCK]:
+            cache_images[url][CACHE_CONTENT] = content, content_type
+            while len(cache_images) > cache_maxsize:
+                cache_images.popitem(last=False)
+
+        return content, content_type
+
+    async def _async_fetch_image(self, url):
+        """Retrieve an image."""
+        content, content_type = (None, None)
+        websession = async_get_clientsession(self.hass)
+        try:
+            with async_timeout.timeout(10):
+                response = await websession.get(url)
+
+                if response.status == HTTP_OK:
+                    content = await response.read()
+                    content_type = response.headers.get(CONTENT_TYPE)
+                    if content_type:
+                        content_type = content_type.split(";")[0]
+
+        except asyncio.TimeoutError:
+            pass
+
+        if content is None:
+            _LOGGER.warning("Error retrieving proxied image from %s", url)
+
+        return content, content_type
+
+    def get_browse_image_url(
+        self,
+        media_content_type: str,
+        media_content_id: str,
+        media_image_id: Optional[str] = None,
+    ) -> str:
+        """Generate an url for a media browser image."""
+        url_path = (
+            f"/api/media_player_proxy/{self.entity_id}/browse_media"
+            f"/{media_content_type}/{media_content_id}"
+        )
+
+        url_query = {"token": self.access_token}
+        if media_image_id:
+            url_query["media_image_id"] = media_image_id
+
+        return str(URL(url_path).with_query(url_query))
 
 
 class MediaPlayerImageView(HomeAssistantView):
     """Media player view to serve an image."""
 
     requires_auth = False
-    url = "/api/media_player_proxy/<entity(domain=media_player):entity_id>"
+    url = "/api/media_player_proxy/{entity_id}"
     name = "api:media_player:image"
+    extra_urls = [
+        url + "/browse_media/{media_content_type}/{media_content_id}",
+    ]
 
-    def __init__(self, hass, entities):
+    def __init__(self, component):
         """Initialize a media player view."""
-        super().__init__(hass)
-        self.entities = entities
+        self.component = component
 
-    def get(self, request, entity_id):
+    async def get(
+        self,
+        request: web.Request,
+        entity_id: str,
+        media_content_type: Optional[str] = None,
+        media_content_id: Optional[str] = None,
+    ) -> web.Response:
         """Start a get request."""
-        player = self.entities.get(entity_id)
-
+        player = self.component.get_entity(entity_id)
         if player is None:
-            return self.Response(status=404)
+            status = HTTP_NOT_FOUND if request[KEY_AUTHENTICATED] else HTTP_UNAUTHORIZED
+            return web.Response(status=status)
 
-        authenticated = (request.authenticated or
-                         request.args.get('token') == player.access_token)
+        authenticated = (
+            request[KEY_AUTHENTICATED]
+            or request.query.get("token") == player.access_token
+        )
 
         if not authenticated:
-            return self.Response(status=401)
+            return web.Response(status=HTTP_UNAUTHORIZED)
 
-        image_url = player.media_image_url
-        if image_url:
-            response = requests.get(image_url)
+        if media_content_type and media_content_id:
+            media_image_id = request.query.get("media_image_id")
+            data, content_type = await player.async_get_browse_image(
+                media_content_type, media_content_id, media_image_id
+            )
         else:
-            response = None
+            data, content_type = await player.async_get_media_image()
 
-        if response is None:
-            return self.Response(status=500)
+        if data is None:
+            return web.Response(status=HTTP_INTERNAL_SERVER_ERROR)
 
-        return self.Response(response)
+        headers: LooseHeaders = {CACHE_CONTROL: "max-age=3600"}
+        return web.Response(body=data, content_type=content_type, headers=headers)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "media_player_thumbnail",
+        vol.Required("entity_id"): cv.entity_id,
+    }
+)
+@websocket_api.async_response
+async def websocket_handle_thumbnail(hass, connection, msg):
+    """Handle get media player cover command.
+
+    Async friendly.
+    """
+    component = hass.data[DOMAIN]
+    player = component.get_entity(msg["entity_id"])
+
+    if player is None:
+        connection.send_message(
+            websocket_api.error_message(msg["id"], ERR_NOT_FOUND, "Entity not found")
+        )
+        return
+
+    _LOGGER.warning(
+        "The websocket command media_player_thumbnail is deprecated. Use /api/media_player_proxy instead"
+    )
+
+    data, content_type = await player.async_get_media_image()
+
+    if data is None:
+        connection.send_message(
+            websocket_api.error_message(
+                msg["id"], "thumbnail_fetch_failed", "Failed to fetch thumbnail"
+            )
+        )
+        return
+
+    await connection.send_big_result(
+        msg["id"],
+        {
+            "content_type": content_type,
+            "content": base64.b64encode(data).decode("utf-8"),
+        },
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "media_player/browse_media",
+        vol.Required("entity_id"): cv.entity_id,
+        vol.Inclusive(
+            ATTR_MEDIA_CONTENT_TYPE,
+            "media_ids",
+            "media_content_type and media_content_id must be provided together",
+        ): str,
+        vol.Inclusive(
+            ATTR_MEDIA_CONTENT_ID,
+            "media_ids",
+            "media_content_type and media_content_id must be provided together",
+        ): str,
+    }
+)
+@websocket_api.async_response
+async def websocket_browse_media(hass, connection, msg):
+    """
+    Browse media available to the media_player entity.
+
+    To use, media_player integrations can implement MediaPlayerEntity.async_browse_media()
+    """
+    component = hass.data[DOMAIN]
+    player: Optional[MediaPlayerDevice] = component.get_entity(msg["entity_id"])
+
+    if player is None:
+        connection.send_error(msg["id"], "entity_not_found", "Entity not found")
+        return
+
+    if not player.supported_features & SUPPORT_BROWSE_MEDIA:
+        connection.send_message(
+            websocket_api.error_message(
+                msg["id"], ERR_NOT_SUPPORTED, "Player does not support browsing media"
+            )
+        )
+        return
+
+    media_content_type = msg.get(ATTR_MEDIA_CONTENT_TYPE)
+    media_content_id = msg.get(ATTR_MEDIA_CONTENT_ID)
+
+    try:
+        payload = await player.async_browse_media(media_content_type, media_content_id)
+    except NotImplementedError:
+        _LOGGER.error(
+            "%s allows media browsing but its integration (%s) does not",
+            player.entity_id,
+            player.platform.platform_name,
+        )
+        connection.send_message(
+            websocket_api.error_message(
+                msg["id"],
+                ERR_NOT_SUPPORTED,
+                "Integration does not support browsing media",
+            )
+        )
+        return
+    except BrowseError as err:
+        connection.send_message(
+            websocket_api.error_message(msg["id"], ERR_UNKNOWN_ERROR, str(err))
+        )
+        return
+
+    # For backwards compat
+    if isinstance(payload, BrowseMedia):
+        payload = payload.as_dict()
+    else:
+        _LOGGER.warning("Browse Media should use new BrowseMedia class")
+
+    connection.send_result(msg["id"], payload)
+
+
+class MediaPlayerDevice(MediaPlayerEntity):
+    """ABC for media player devices (for backwards compatibility)."""
+
+    def __init_subclass__(cls, **kwargs):
+        """Print deprecation warning."""
+        super().__init_subclass__(**kwargs)
+        _LOGGER.warning(
+            "MediaPlayerDevice is deprecated, modify %s to extend MediaPlayerEntity",
+            cls.__name__,
+        )
+
+
+class BrowseMedia:
+    """Represent a browsable media file."""
+
+    def __init__(
+        self,
+        *,
+        media_class: str,
+        media_content_id: str,
+        media_content_type: str,
+        title: str,
+        can_play: bool,
+        can_expand: bool,
+        children: Optional[List["BrowseMedia"]] = None,
+        children_media_class: Optional[str] = None,
+        thumbnail: Optional[str] = None,
+    ):
+        """Initialize browse media item."""
+        self.media_class = media_class
+        self.media_content_id = media_content_id
+        self.media_content_type = media_content_type
+        self.title = title
+        self.can_play = can_play
+        self.can_expand = can_expand
+        self.children = children
+        self.children_media_class = children_media_class
+        self.thumbnail = thumbnail
+
+    def as_dict(self, *, parent: bool = True) -> dict:
+        """Convert Media class to browse media dictionary."""
+        if self.children_media_class is None:
+            self.calculate_children_class()
+
+        response = {
+            "title": self.title,
+            "media_class": self.media_class,
+            "media_content_type": self.media_content_type,
+            "media_content_id": self.media_content_id,
+            "can_play": self.can_play,
+            "can_expand": self.can_expand,
+            "children_media_class": self.children_media_class,
+            "thumbnail": self.thumbnail,
+        }
+
+        if not parent:
+            return response
+
+        if self.children:
+            response["children"] = [
+                child.as_dict(parent=False) for child in self.children
+            ]
+        else:
+            response["children"] = []
+
+        return response
+
+    def calculate_children_class(self) -> None:
+        """Count the children media classes and calculate the correct class."""
+        if self.children is None or len(self.children) == 0:
+            return
+
+        self.children_media_class = MEDIA_CLASS_DIRECTORY
+
+        proposed_class = self.children[0].media_class
+        if all(child.media_class == proposed_class for child in self.children):
+            self.children_media_class = proposed_class
