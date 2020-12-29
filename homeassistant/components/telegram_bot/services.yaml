@@ -47,11 +47,14 @@ send_photo:
       description: The title of the image.
       example: "My image"
     username:
-      description: Username for a URL which require HTTP basic authentication.
+      description: Username for a URL which require HTTP authentication.
       example: myuser
     password:
-      description: Password for a URL which require HTTP basic authentication.
+      description: Password (or bearer token) for a URL which require HTTP authentication.
       example: myuser_pwd
+    authentication:
+      description: Define which authentication method to use. Set to `digest` to use HTTP digest authentication, or `bearer_token` for OAuth 2.0 bearer token authentication. Defaults to `basic`.
+      example: digest
     target:
       description: An array of pre-authorized chat_ids to send the document to. If not present, first allowed chat_id is the default.
       example: "[12345, 67890] or 12345"
@@ -87,11 +90,14 @@ send_sticker:
       description: Local path to a static .webp or animated .tgs sticker.
       example: "/path/to/the/sticker.webp"
     username:
-      description: Username for a URL which require HTTP basic authentication.
+      description: Username for a URL which require HTTP authentication.
       example: myuser
     password:
-      description: Password for a URL which require HTTP basic authentication.
+      description: Password (or bearer token) for a URL which require HTTP authentication.
       example: myuser_pwd
+    authentication:
+      description: Define which authentication method to use. Set to `digest` to use HTTP digest authentication, or `bearer_token` for OAuth 2.0 bearer token authentication. Defaults to `basic`.
+      example: digest
     target:
       description: An array of pre-authorized chat_ids to send the document to. If not present, first allowed chat_id is the default.
       example: "[12345, 67890] or 12345"
@@ -127,11 +133,14 @@ send_animation:
       description: The title of the animation.
       example: "My animation"
     username:
-      description: Username for a URL which require HTTP basic authentication.
+      description: Username for a URL which require HTTP authentication.
       example: myuser
     password:
-      description: Password for a URL which require HTTP basic authentication.
+      description: Password (or bearer token) for a URL which require HTTP authentication.
       example: myuser_pwd
+    authentication:
+      description: Define which authentication method to use. Set to `digest` to use HTTP digest authentication, or `bearer_token` for OAuth 2.0 bearer token authentication. Defaults to `basic`.
+      example: digest
     target:
       description: An array of pre-authorized chat_ids to send the document to. If not present, first allowed chat_id is the default.
       example: "[12345, 67890] or 12345"
@@ -167,11 +176,14 @@ send_video:
       description: The title of the video.
       example: "My video"
     username:
-      description: Username for a URL which require HTTP basic authentication.
+      description: Username for a URL which require HTTP authentication.
       example: myuser
     password:
-      description: Password for a URL which require HTTP basic authentication.
+      description: Password (or bearer token) for a URL which require HTTP authentication.
       example: myuser_pwd
+    authentication:
+      description: Define which authentication method to use. Set to `digest` to use HTTP digest authentication, or `bearer_token` for OAuth 2.0 bearer token authentication. Defaults to `basic`.
+      example: digest
     target:
       description: An array of pre-authorized chat_ids to send the document to. If not present, first allowed chat_id is the default.
       example: "[12345, 67890] or 12345"
@@ -210,11 +222,14 @@ send_voice:
       description: The title of the voice message.
       example: "My microphone recording"
     username:
-      description: Username for a URL which require HTTP basic authentication.
+      description: Username for a URL which require HTTP authentication.
       example: myuser
     password:
-      description: Password for a URL which require HTTP basic authentication.
+      description: Password (or bearer token) for a URL which require HTTP authentication.
       example: myuser_pwd
+    authentication:
+      description: Define which authentication method to use. Set to `digest` to use HTTP digest authentication, or `bearer_token` for OAuth 2.0 bearer token authentication. Defaults to `basic`.
+      example: digest
     target:
       description: An array of pre-authorized chat_ids to send the document to. If not present, first allowed chat_id is the default.
       example: "[12345, 67890] or 12345"
@@ -250,11 +265,14 @@ send_document:
       description: The title of the document.
       example: Document Title xy
     username:
-      description: Username for a URL which require HTTP basic authentication.
+      description: Username for a URL which require HTTP authentication.
       example: myuser
     password:
-      description: Password for a URL which require HTTP basic authentication.
+      description: Password (or bearer token) for a URL which require HTTP authentication.
       example: myuser_pwd
+    authentication:
+      description: Define which authentication method to use. Set to `digest` to use HTTP digest authentication, or `bearer_token` for OAuth 2.0 bearer token authentication. Defaults to `basic`.
+      example: digest
     target:
       description: An array of pre-authorized chat_ids to send the document to. If not present, first allowed chat_id is the default.
       example: "[12345, 67890] or 12345"
